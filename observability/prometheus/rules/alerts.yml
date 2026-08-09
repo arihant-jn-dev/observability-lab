@@ -1,0 +1,278 @@
+# =============================================================================
+#  ALERTS
+# =============================================================================
+#  THE ONE RULE THAT MATTERS:
+#
+#      PAGE ON SYMPTOMS. TICKET ON CAUSES.
+#
+#  A symptom is something a user can feel: requests failing, requests slow,
+#  orders not being created. A cause is a mechanism: CPU high, pool saturated,
+#  cache cold, memory climbing.
+#
+#  Why the distinction is not pedantry:
+#    - There are a handful of symptoms and an unbounded number of causes. If you
+#      alert on causes you will write alerts forever and still miss the outage
+#      caused by cause #47 that you never thought of.
+#    - Causes fire when nothing is wrong. CPU at 95% with latency fine is a
+#      well-utilised machine, not an incident. Page on that and people start
+#      ignoring the pager, which is how real outages get missed.
+#    - A symptom alert catches novel failures. You did not predict the failure
+#      mode, but you predicted that users would notice.
+#
+#  Cause alerts still earn their place -- as TICKETS. They are what you look at
+#  AFTER a symptom alert fires, and they are how you catch slow degradation
+#  before it becomes a symptom. They just must not wake anyone up.
+#
+#  `severity: page`   -> wake a human
+#  `severity: ticket` -> look at it during working hours
+#  `severity: info`   -> dashboard annotation only
+# =============================================================================
+
+groups:
+
+  # ===========================================================================
+  #  SYMPTOMS -- these are allowed to wake you
+  # ===========================================================================
+  - name: symptoms
+    interval: 15s
+    rules:
+
+      - alert: HighErrorRate
+        # A RATIO, not a count. 50 errors/sec is catastrophic at 100 rps and
+        # meaningless at 100k rps. Counts do not survive traffic growth; every
+        # count-based threshold you set today is wrong after your next good
+        # quarter.
+        expr: |
+          sum(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+            /
+          clamp_min(sum(rate(http_server_request_duration_seconds_count[5m])), 0.001)
+            > 0.05
+        # `for` is what separates a blip from an incident. Without it you page
+        # on every transient. Too long and you are late. 2m is aggressive for a
+        # lab so the exercises actually fire; production is usually 5-15m.
+        for: 2m
+        labels:
+          severity: page
+          signal: symptom
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of requests are failing"
+          description: >-
+            More than 5% of requests have returned 5xx for 2 minutes.
+            FIRST: open the RED dashboard, find which route (the service-wide
+            number may be one endpoint at 100%). THEN: click an exemplar on that
+            route to open a failing trace, and follow it to the logs.
+          runbook: "docs/01-first-look.md"
+
+      - alert: HighLatencyP99
+        # p99, not mean. See docs/02-percentiles.md -- with our own numbers, the
+        # mean stayed inside its normal range while p99 went up 40x.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_request_duration_seconds_bucket{service_name="orders-api"}[5m]))
+          ) > 1
+        for: 2m
+        labels:
+          severity: page
+          signal: symptom
+        annotations:
+          summary: "p99 latency is {{ $value | humanizeDuration }}"
+          description: >-
+            The slowest 1% of requests are taking over 1s. At 100 rps that is
+            one unhappy user every second.
+            Check whether p50 moved too: if p50 is flat and only p99 rose, you
+            have a SUBSET problem (one slow dependency, cold cache, one bad
+            replica) rather than a general slowdown.
+          runbook: "docs/02-percentiles.md"
+
+      - alert: OrdersStopped
+        # THE MOST IMPORTANT ALERT IN THIS FILE.
+        #
+        # Every other alert here can be green while the business is dead. If a
+        # deploy makes checkout silently return an empty cart, error rate is 0%,
+        # latency is excellent, CPU is low -- and revenue is zero. Only a
+        # business metric catches that class of failure.
+        #
+        # The `and` guard matters: at 3am there may legitimately be no orders.
+        # We only alert when traffic EXISTS but orders do not, which is the
+        # difference between "quiet" and "broken".
+        expr: |
+          sum(rate(orders_created_total[10m])) == 0
+          and
+          sum(rate(http_server_request_duration_seconds_count{http_route="/checkout"}[10m])) > 0.05
+        for: 5m
+        labels:
+          severity: page
+          signal: symptom
+        annotations:
+          summary: "Checkout traffic is arriving but ZERO orders are being created"
+          description: >-
+            Requests are hitting /checkout but no order has been created in 10
+            minutes. This is the failure mode that every technical metric misses.
+            Look at the trace for a recent /checkout: it is probably returning
+            200 while failing internally.
+          runbook: "docs/05-alerts.md"
+
+      - alert: QueueLagGrowing
+        # Async work has its own user-visible symptom. The request succeeded;
+        # the work did not happen. Lag (not depth) is what the user feels.
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(job_queue_lag_seconds_bucket[5m]))) > 30
+        for: 3m
+        labels:
+          severity: page
+          signal: symptom
+        annotations:
+          summary: "Background jobs are waiting {{ $value | humanizeDuration }} before being picked up"
+          description: >-
+            Orders are being accepted but not fulfilled promptly. Either the
+            worker is down, is slower than the incoming rate, or is stuck on one
+            poisonous job. Check the worker's traces.
+
+      - alert: ServiceDown
+        # `up` is generated by Prometheus itself, not by the app -- which is why
+        # it still works when the app is too broken to emit anything. A push
+        # system cannot do this: silence is indistinguishable from health.
+        expr: up{job=~"otel-collector|postgres-exporter|redis-exporter"} == 0
+        for: 1m
+        labels:
+          severity: page
+          signal: symptom
+        annotations:
+          summary: "Scrape target {{ $labels.job }} is down"
+          description: >-
+            Prometheus cannot reach this target. If it is the collector, EVERY
+            app graph will go flat and look exactly like 'no traffic' -- which
+            is why this alert exists and why you should trust it over the
+            suspiciously quiet dashboards.
+
+  # ===========================================================================
+  #  CAUSES -- useful, but must never wake anyone
+  # ===========================================================================
+  - name: causes
+    interval: 30s
+    rules:
+
+      - alert: DbPoolSaturated
+        # The single most misdiagnosed shape of "slow". Requests are queueing
+        # for a connection: nothing failed, the DB is idle, CPU is flat.
+        expr: sum(db_pool_connections{state="waiting"}) > 0
+        for: 2m
+        labels:
+          severity: ticket
+          signal: cause
+        annotations:
+          summary: "{{ $value }} requests are queueing for a database connection"
+          description: >-
+            Pool saturation. Note what this looks like everywhere else: the
+            database reports low CPU and no slow queries, the app reports low
+            CPU, and yet latency is bad. The time is spent waiting for a
+            connection, which only this metric and a trace gap will show you.
+
+      - alert: CacheHitRatioCollapsed
+        # Not "hit ratio is low" -- low is fine and depends on workload. The
+        # alert is on a SUDDEN DROP, because that is what precedes the database
+        # receiving traffic it was never sized for.
+        expr: |
+          (
+            sum(rate(cache_operations_total{result="hit"}[5m]))
+            / clamp_min(sum(rate(cache_operations_total[5m])), 0.001)
+          ) < 0.5
+          and
+          sum(rate(cache_operations_total[5m])) > 1
+        for: 3m
+        labels:
+          severity: ticket
+          signal: cause
+        annotations:
+          summary: "Cache hit ratio has fallen to {{ $value | humanizePercentage }}"
+          description: >-
+            A cache that normally absorbs most reads is not absorbing them.
+            Everything the cache was protecting is now taking full load. Watch
+            pg blks_read on the USE dashboard.
+
+      - alert: RedisEvictingKeys
+        # Silent data loss. Nothing errors; the app just sees more misses.
+        expr: rate(redis_evicted_keys_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: ticket
+          signal: cause
+        annotations:
+          summary: "Redis is evicting keys ({{ $value | printf \"%.1f\" }}/s)"
+          description: >-
+            maxmemory has been reached and allkeys-lru is discarding data.
+            Nothing errors, so this is invisible from the app's point of view --
+            it just looks like a cache that keeps going cold.
+
+      - alert: ContainerNearMemoryLimit
+        # Catches the leak BEFORE the OOM kill. Deliberately compares against
+        # the container LIMIT, not the host's memory: the limit is what kills
+        # you, and it is what the app's own heap metric cannot see.
+        expr: |
+          container_memory_usage_total_bytes{container_name=~"obslab-.*"}
+            /
+          clamp_min(container_memory_usage_limit_bytes{container_name=~"obslab-.*"}, 1)
+            > 0.85
+        for: 3m
+        labels:
+          severity: ticket
+          signal: cause
+        annotations:
+          summary: "{{ $labels.container_name }} is at {{ $value | humanizePercentage }} of its memory limit"
+          description: >-
+            Approaching an OOM kill. If this is orders-api during the memLeak
+            exercise, compare with v8js_memory_heap_used_bytes -- in `buffer`
+            mode the heap is flat and swears everything is fine.
+
+      - alert: EventLoopBlocked
+        # Node-specific saturation. High delay + low CPU = blocked on something
+        # synchronous. High delay + high CPU = genuinely compute-bound.
+        expr: nodejs_eventloop_delay_p99_seconds > 0.2
+        for: 2m
+        labels:
+          severity: ticket
+          signal: cause
+        annotations:
+          summary: "{{ $labels.service_name }} event loop delay p99 is {{ $value | humanizeDuration }}"
+          description: >-
+            The event loop cannot keep up. In Node this affects EVERY request in
+            the process, including ones doing no work -- which is why one
+            expensive endpoint can make the whole service look slow.
+
+  # ===========================================================================
+  #  META -- watching the monitoring itself
+  # ===========================================================================
+  - name: meta
+    interval: 60s
+    rules:
+
+      - alert: PrometheusCardinalityGrowing
+        # Your instrumentation can take down your monitoring. This is the alarm
+        # for the cardinality bomb in docs/04-cardinality.md.
+        expr: prometheus_tsdb_head_series > 100000
+        for: 5m
+        labels:
+          severity: ticket
+          signal: meta
+        annotations:
+          summary: "Prometheus is holding {{ $value }} active series"
+          description: >-
+            Series count is climbing. Find the culprit with:
+            topk(10, count by (__name__)({__name__=~".+"}))
+            A single unbounded label (user id, request id, raw URL) is almost
+            always the cause.
+
+      - alert: CollectorDroppingData
+        # If the telemetry pipeline silently drops, every dashboard lies by
+        # omission. Failed exports look exactly like reduced traffic.
+        expr: rate(otelcol_exporter_send_failed_spans_total[5m]) > 0
+             or rate(otelcol_exporter_send_failed_metric_points_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: ticket
+          signal: meta
+        annotations:
+          summary: "The OTel collector is failing to export telemetry"
+          description: >-
+            Data is being dropped between the app and the backends. Your graphs
+            are now under-reporting, and a drop in request rate may be a lie.

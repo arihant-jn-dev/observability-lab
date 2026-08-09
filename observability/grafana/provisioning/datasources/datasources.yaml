@@ -1,0 +1,122 @@
+# =============================================================================
+#  Grafana datasources -- AND the correlation wiring
+# =============================================================================
+#  This file is the most important config in the whole lab. Storing metrics,
+#  traces and logs separately is easy; making one clickable from another is
+#  what turns three databases into an observability system.
+#
+#  The loop it builds:
+#
+#     Prometheus graph  --(exemplar: trace_id)-->  Tempo trace
+#     Tempo trace       --(tracesToLogsV2)------>  Loki log lines
+#     Loki log line     --(derivedField)-------->  Tempo trace
+#
+#  You can enter at any point and reach the other two.
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+
+  # ---------------------------------------------------------------------------
+  #  PROMETHEUS -- "when did it break, and how bad is it?"
+  # ---------------------------------------------------------------------------
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      # Should match Prometheus's scrape_interval, or Grafana will suggest
+      # step values finer than your data actually has and draw misleading gaps.
+      timeInterval: 10s
+
+      # >>> THE METRIC -> TRACE LINK <<<
+      # Tells Grafana that the `trace_id` label on an exemplar is a trace it can
+      # open in the Tempo datasource. This is what makes the little diamonds
+      # under a latency graph clickable.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+          urlDisplayLabel: "View trace"
+
+  # ---------------------------------------------------------------------------
+  #  TEMPO -- "what happened inside THIS request?"
+  # ---------------------------------------------------------------------------
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      httpMethod: GET
+
+      # >>> THE TRACE -> LOGS LINK <<<
+      # From any span, jump to the logs for that same request. The filter
+      # narrows to the right service first (cheap label match), then matches
+      # trace_id in structured metadata (the expensive part, now tiny).
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-2m"
+        spanEndTimeShift: "2m"
+        # Narrow by service using the span's resource attribute -> Loki label.
+        tags:
+          - key: service.name
+            value: service
+        filterByTraceID: true
+        filterBySpanID: false
+
+      # Jump from a span to the RED metrics for its route.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: "-2m"
+        spanEndTimeShift: "2m"
+        tags:
+          - key: service.name
+            value: service_name
+        queries:
+          - name: "Request rate for this service"
+            query: 'sum(rate(traces_span_metrics_calls_total{$$__tags}[5m]))'
+          - name: "p99 latency for this service"
+            query: 'histogram_quantile(0.99, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{$$__tags}[5m])))'
+
+      # Builds the service dependency graph from spanmetrics data.
+      serviceMap:
+        datasourceUid: prometheus
+
+      # Show the node graph / span metrics panels in the trace view.
+      nodeGraph:
+        enabled: true
+
+      search:
+        hide: false
+
+      # Tempo can compute per-span RED from the spanmetrics we already store.
+      lokiSearch:
+        datasourceUid: loki
+
+  # ---------------------------------------------------------------------------
+  #  LOKI -- "what exactly went wrong, in words?"
+  # ---------------------------------------------------------------------------
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # >>> THE LOG -> TRACE LINK <<<
+      # Turns the trace_id in a log line into a button that opens the trace.
+      # `datasourceUid` points at Tempo; `matcherRegex` finds the id.
+      #
+      # Because Alloy stores trace_id as STRUCTURED METADATA, Grafana exposes it
+      # as a field directly -- no regex over the log text needed.
+      derivedFields:
+        - name: TraceID
+          datasourceUid: tempo
+          matcherType: label
+          matcherRegex: trace_id
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace"
+      maxLines: 1000

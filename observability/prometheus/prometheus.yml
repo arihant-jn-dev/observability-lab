@@ -1,0 +1,85 @@
+# =============================================================================
+#  Prometheus
+# =============================================================================
+#  Prometheus PULLS. It reaches out and scrapes each target on a fixed interval.
+#  Consequences worth internalising:
+#
+#   - A target that disappears produces `up == 0`, which is a signal. A push
+#     system that goes quiet produces nothing, which is indistinguishable from
+#     "nothing happened". This is why `up` is one of the most valuable series
+#     you have.
+#   - Prometheus only ever sees SAMPLES, taken every scrape_interval. Anything
+#     that happened entirely between two scrapes is invisible. A 5-second
+#     outage on a 15-second interval may never appear at all.
+#   - Every distinct label combination is a separate stored time series. This
+#     is the cardinality trap -- see docs/04-cardinality.md.
+# =============================================================================
+
+global:
+  # 10s is faster than production defaults (usually 15-60s) so the lab feels
+  # responsive. Remember this when reading rate() windows below: a rate window
+  # must span at least 4 scrape intervals to be stable.
+  scrape_interval: 10s
+  evaluation_interval: 10s
+  external_labels:
+    cluster: obslab
+
+# Alert rules live here (stage 7).
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+scrape_configs:
+  # --- application telemetry, via the collector -----------------------------
+  # Everything the app emits arrives here. `honor_labels` is deliberately off:
+  # we want Prometheus's own job/instance labels attached.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]
+        labels:
+          source: app
+    # Exemplars ride along on OpenMetrics-formatted scrapes. Prometheus needs
+    # --enable-feature=exemplar-storage (set in docker-compose.yml) to keep them.
+
+  # --- the collector's own health ------------------------------------------
+  - job_name: otel-collector-internal
+    static_configs:
+      - targets: ["otel-collector:8888"]
+        labels:
+          source: pipeline
+
+  # --- Prometheus watching itself ------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          source: pipeline
+
+  # --- infra exporters (stage 5) -------------------------------------------
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels:
+          source: infra
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          source: infra
+
+  - job_name: postgres-exporter
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          source: infra
+
+  - job_name: redis-exporter
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+        labels:
+          source: infra

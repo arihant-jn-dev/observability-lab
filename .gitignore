@@ -1,0 +1,24 @@
+# Dependencies — 251MB of the 252MB repo. Reinstalled with `npm install`,
+# pinned exactly by the committed package-lock.json files.
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+*.swp
+
+# Local scratch / experiments
+*.local
+scratch/
+tmp/
+
+# NOTE: .env IS committed on purpose. Every host port comes from it, so the
+# stack does not start without it. The only credentials in it are lab/lab and
+# admin/admin, which are already printed in README.md and docker-compose.yml.
+# If you fork this for anything real, rotate them and gitignore this file.

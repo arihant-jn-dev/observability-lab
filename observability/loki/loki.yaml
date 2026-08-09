@@ -1,0 +1,66 @@
+# =============================================================================
+#  Loki -- the log store
+# =============================================================================
+#  Loki's core idea: DO NOT index the log text. Index only a small set of
+#  labels, store the rest as compressed chunks, and brute-force scan at query
+#  time. That is why it is cheap compared to Elasticsearch, and it dictates the
+#  single most important rule for using it:
+#
+#      LABELS ARE FOR NARROWING THE STREAM, NOT FOR SEARCHING.
+#
+#  Every unique combination of label values creates a separate "stream" with
+#  its own index entry and its own set of chunks. A handful of bounded labels
+#  (service, level, container) is right. Putting trace_id in a label would
+#  create one stream per request and destroy the database -- which is exactly
+#  why our Alloy config attaches trace_id as STRUCTURED METADATA instead.
+#  See observability/alloy/config.alloy.
+# =============================================================================
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Required for the trace_id -> log correlation to work as structured
+  # metadata rather than as a (catastrophic) label.
+  allow_structured_metadata: true
+  volume_enabled: true
+  retention_period: 24h
+  # A lab generates bursts; keep Loki from rejecting them.
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  # Our containers start before Loki sometimes; accept slightly old lines.
+  reject_old_samples: false
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+
+analytics:
+  reporting_enabled: false

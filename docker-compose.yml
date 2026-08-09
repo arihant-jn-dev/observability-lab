@@ -1,0 +1,723 @@
+# =============================================================================
+#  OBSERVABILITY LAB -- docker-compose.yml
+# =============================================================================
+#
+#  A deliberately breakable order/checkout API wired to a full self-hosted
+#  observability stack. 15 services (+k6 on demand), ~1.05GB RAM at idle.
+#
+#  Services are grouped below by the stage that introduced them, and each
+#  carries a comment explaining WHY IT IS HERE -- not just what it is.
+#
+#  All host ports come from .env -- see that file for the full port map and for
+#  which ports were avoided because they are already taken on your machine.
+#
+#  ---------------------------------------------------------------------------
+#  HOW THE INFRASTRUCTURE FITS TOGETHER
+#  ---------------------------------------------------------------------------
+#  Ports shown as :NNNN are HOST ports (what you type in a browser). Inside the
+#  compose network, services reach each other by SERVICE NAME on the container
+#  port -- e.g. the app sends telemetry to http://otel-collector:4318, never to
+#  localhost. That distinction trips up almost everyone once.
+#
+#
+#  (1) DATA PLANE -- what the application actually does
+#  ...........................................................................
+#
+#        you / k6
+#            │  HTTP :8080
+#            ▼
+#      ┌─────────────┐   HTTP  :8081   ┌──────────────┐
+#      │ orders-api  │ ──────────────► │ payments-api │   the "3rd party"
+#      └──┬───┬───┬──┘   (traced,      └──────────────┘   gateway; exists so
+#         │   │   │       context propagates)             traces cross a
+#         │   │   │                                       process boundary
+#         │   │   └── SQL ──────────────┐
+#         │   │                         ▼
+#         │   │  GET/SET  ┌─────────┐  ┌──────────┐  :5433
+#         │   └─────────► │  redis  │  │ postgres │  500 products / 5k orders
+#         │    (cache)    │  :6380  │  └──────────┘  20k order_items
+#         │               │         │       ▲
+#         │    LPUSH      │  queue  │       │ SQL
+#         └─────────────► │         │       │
+#                         └────┬────┘  ┌────┴──────────┐
+#                              │ RPOP  │ orders-worker │  separate PROCESS ->
+#                              └──────►│               │  trace context must
+#                                      └───────────────┘  be passed BY HAND
+#
+#
+#  (2) TELEMETRY PLANE -- how signals get out and where they land
+#  ...........................................................................
+#
+#    orders-api    ─┐
+#    orders-worker ─┼─ OTLP/HTTP :4318 ─►┌────────────────────┐
+#    payments-api  ─┘  (metrics+traces)  │   otel-collector   │
+#                                        │                    │
+#                      /var/run/docker.sock ─► docker_stats   │ per-container
+#                                        │                    │ cpu/mem/net
+#                                        │  memory_limiter    │
+#                                        │  resource/trim  ◄──┼─ cardinality
+#                                        │  batch             │  control
+#                                        │  spanmetrics ──────┼─ makes RED
+#                                        └──┬──────────────┬──┘  + EXEMPLARS
+#                        exposes :8889 -----┘              │
+#                        (Prometheus PULLS from here)      │ OTLP push
+#                                    │                     ▼
+#                                    │                ┌─────────┐
+#                                    │                │  tempo  │ :3210
+#                                    │                │ TRACES  │
+#                                    │                └─────────┘
+#                                    ▼
+#      cadvisor          :8083 ─┐   ┌──────────────┐
+#      node-exporter     :9100 ─┼──►│  prometheus  │ :9090
+#      postgres-exporter :9187 ─┤   │   METRICS    │  + 12 alert rules
+#      redis-exporter    :9121 ─┘   └──────────────┘
+#           (Prometheus scrapes each every 10s; a dead target = `up 0`,
+#            which is a SIGNAL. A push system going quiet is just silence.)
+#
+#      all containers ── stdout (JSON) ──► ┌───────┐ push  ┌────────┐
+#                     (via docker.sock)    │ alloy │ ────► │  loki  │ :3110
+#                                          │ :12345│       │  LOGS  │
+#                                          └───────┘       └────────┘
+#           alloy parses Pino JSON, then splits fields two ways:
+#             level/service/role -> LABELS  (bounded, indexed)
+#             trace_id           -> STRUCTURED METADATA (unbounded, not indexed)
+#           trace_id as a label would create one Loki stream per request.
+#
+#
+#  (3) QUERY PLANE -- and the correlation loop, which is the whole point
+#  ...........................................................................
+#
+#                    ┌───────────┐
+#      you ────────► │  grafana  │ :3300   (no login)
+#                    └─────┬─────┘
+#                          │ reads all three
+#          ┌───────────────┼───────────────┐
+#          ▼               ▼               ▼
+#     prometheus         tempo            loki
+#          │               │               │
+#          │ exemplar      │ tracesToLogsV2│ derivedFields
+#          │ (trace_id)    │ (trace_id)    │ (trace_id)
+#          └──────────────►└──────────────►└─────┐
+#                          ▲                     │
+#                          └─────────────────────┘
+#
+#      Click a latency spike -> land in that exact trace -> jump to the log
+#      lines for that one request. Three stores, one workflow. Wired in
+#      observability/grafana/provisioning/datasources/datasources.yaml
+#
+#  ---------------------------------------------------------------------------
+#  COMMANDS, IN ORDER
+#  ---------------------------------------------------------------------------
+#    docker compose up -d --build      # 1. build images and start everything
+#    docker compose ps                 # 2. confirm every service is healthy
+#    make verify                       # 3. end-to-end check (19 assertions)
+#    open http://localhost:3300        # 4. Grafana (no login required)
+#
+#    docker compose run --rm k6 run /scripts/01-baseline.js   # generate load
+#    make heal                         # switch off every pathology
+#    docker compose logs -f orders-api # follow one service's logs
+#    docker compose down               # stop, keep data volumes
+#    docker compose down -v            # stop AND wipe data (re-seeds Postgres)
+#
+#  NOTE ON `down -v`: db/init/*.sql only runs when the Postgres data directory
+#  is empty. If you edit the schema or seed, you MUST `down -v` or your changes
+#  will appear to be ignored.
+#
+#  NOTE ON CONFIG EDITS: bind-mounted config files (prometheus.yml,
+#  config.alloy, the collector config) are NOT re-read on `up -d` -- Compose
+#  does not notice content changes. Use `docker compose restart <service>`.
+# =============================================================================
+
+name: obslab
+
+services:
+
+  # ===========================================================================
+  #  POSTGRES -- the system of record
+  # ===========================================================================
+  #  WHY IT IS HERE: it is the slow, stateful thing every other component
+  #  exists to protect. Most of the interesting failures in this lab are
+  #  ultimately about load arriving at this container that was supposed to be
+  #  absorbed somewhere else.
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: obslab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # pg_stat_statements must be preloaded at server start -- it cannot be
+    # enabled later with CREATE EXTENSION alone. It records per-statement call
+    # counts and timings, which is how postgres_exporter (stage 5) can show you
+    # WHICH query is hammering the database during the N+1 exercise.
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      # Log any statement slower than 200ms. Useful to contrast with tracing:
+      # notice the N+1 exercise produces NO slow-query log lines at all.
+      - -c
+      - log_min_duration_statement=200
+    ports:
+      # host:container -- 5433 because your pgvector container owns 5432.
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Scripts here run once, alphabetically, on first boot of an empty volume.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Other services `depends_on` this condition, so they wait for a database
+      # that can actually accept queries rather than merely a running container.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  # ===========================================================================
+  #  REDIS -- the cache and the job queue
+  # ===========================================================================
+  #  WHY IT IS HERE: it plays two very different roles, and the lab uses both.
+  #    1. Read-through cache for /products -- a PERFORMANCE component whose
+  #       loss is supposed to be survivable (the `flushCache` exercise proves
+  #       that assumption wrong).
+  #    2. The job queue the worker consumes -- a CORRECTNESS component whose
+  #       loss means orders silently stop being fulfilled.
+  #  Same server, same container, completely different blast radius.
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: obslab-redis
+    restart: unless-stopped
+    # maxmemory is deliberately small so eviction is reachable in a lab.
+    # allkeys-lru means Redis will THROW AWAY cached data rather than reject
+    # writes -- which is right for a cache and catastrophic for a queue. Both
+    # live in this one instance, which is itself a lesson.
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    ports:
+      # 6380 because you already have Redis on 6379.
+      - "${REDIS_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 160M
+
+  # ===========================================================================
+  #  PAYMENTS-API -- the downstream dependency
+  # ===========================================================================
+  #  WHY IT IS HERE: purely so tracing has something to trace ACROSS. A single
+  #  service produces flat, boring traces. With two, you can see a request
+  #  cross a process boundary and watch latency get attributed to the service
+  #  that actually caused it.
+  #
+  #  It is also the target of the `slowDependency` pathology: orders-api asks
+  #  it to be slow via a header, so the delay genuinely happens in another
+  #  process rather than being faked locally.
+  # ===========================================================================
+  payments-api:
+    build:
+      context: ./services/payments-api
+    container_name: obslab-payments-api
+    restart: unless-stopped
+    environment:
+      PORT: 8081
+      OTEL_SERVICE_NAME: payments-api
+      # Stage 1 runs WITHOUT telemetry. Stage 2 flips this to "true".
+      OTEL_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      LOG_LEVEL: info
+    ports:
+      - "${PAYMENTS_API_PORT}:8081"
+    volumes:
+      # Bind-mounting src means you can edit code on your Mac and restart the
+      # container without rebuilding the image.
+      - ./services/payments-api/src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ===========================================================================
+  #  ORDERS-API -- the service under study
+  # ===========================================================================
+  #  WHY IT IS HERE: this is the thing you are learning to observe. Everything
+  #  else in this file exists either to support it or to watch it.
+  #
+  #  Its pathologies are toggled at RUNTIME through /admin/pathologies -- no
+  #  restarts, because restarting resets the very memory profile and metric
+  #  history you are trying to study.
+  # ===========================================================================
+  orders-api:
+    build:
+      context: ./services/orders-api
+    container_name: obslab-orders-api
+    restart: unless-stopped
+    environment:
+      ROLE: api
+      PORT: 8080
+      OTEL_SERVICE_NAME: orders-api
+      OTEL_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      # Service-to-service addressing uses compose DNS names, not localhost.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      PAYMENTS_URL: http://payments-api:8081
+      LOG_LEVEL: info
+      # See the comment in src/db.ts -- a small pool is the queueing lesson.
+      PG_POOL_MAX: 10
+      CACHE_TTL_SECONDS: 60
+      # --expose-gc lets POST /admin/memory/release actually run a collection,
+      # so you can watch heap come back down after the memLeak exercise.
+      # (RSS will lag behind heap: V8 does not hand freed pages back to the OS
+      # eagerly. That gap between "heap freed" and "RSS returned" is itself a
+      # thing worth seeing -- it is why RSS alone is a poor leak signal.)
+      NODE_OPTIONS: "--expose-gc"
+    ports:
+      - "${ORDERS_API_PORT}:8080"
+    volumes:
+      - ./services/orders-api/src:/app/src:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          # Deliberately generous enough to run, tight enough that the memLeak
+          # pathology can actually reach it and trigger an OOM kill.
+          memory: 512M
+
+  # ===========================================================================
+  #  ORDERS-WORKER -- the background consumer
+  # ===========================================================================
+  #  WHY IT IS HERE: async work is where observability gets hard. The worker
+  #  runs in a DIFFERENT process from the API, so:
+  #    - trace context does not reach it for free (see src/queue.ts)
+  #    - its pathology toggles are separate from the API's
+  #    - "the request succeeded" and "the work happened" become different
+  #      questions, which is exactly why queue lag deserves its own metric.
+  #
+  #  Same image as orders-api, different command and ROLE.
+  # ===========================================================================
+  orders-worker:
+    build:
+      context: ./services/orders-api
+    container_name: obslab-orders-worker
+    restart: unless-stopped
+    command: ["npx", "tsx", "src/worker.ts"]
+    environment:
+      ROLE: worker
+      OTEL_SERVICE_NAME: orders-api     # same service, different role attribute
+      OTEL_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+      PG_POOL_MAX: 5
+    volumes:
+      - ./services/orders-api/src:/app/src:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ===========================================================================
+  #  OTEL-COLLECTOR -- the telemetry seam                        [stage 2]
+  # ===========================================================================
+  #  WHY IT IS HERE: so the app knows exactly one telemetry address and nothing
+  #  about Prometheus, Tempo or Loki. Routing, batching and format translation
+  #  happen here, where you can change them without redeploying the app.
+  #
+  #  It is also the cost-control point: sampling and attribute-dropping belong
+  #  here, not scattered through service code.
+  # ===========================================================================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.119.0
+    container_name: obslab-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    # Needs root to read the Docker socket for the docker_stats receiver.
+    user: "0:0"
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otel/config.yaml:ro
+      # For the docker_stats receiver -- per-container CPU/memory/network.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "${OTLP_GRPC_PORT}:4317"      # OTLP gRPC ingest
+      - "${OTLP_HTTP_PORT}:4318"      # OTLP HTTP ingest (what our Node SDK uses)
+      - "${COLLECTOR_METRICS_PORT}:8889"  # Prometheus scrapes THIS for app metrics
+    deploy:
+      resources:
+        limits:
+          memory: 224M
+
+  # ===========================================================================
+  #  PROMETHEUS -- the metrics store                             [stage 2]
+  # ===========================================================================
+  #  WHY IT IS HERE: metrics answer "how much / how often / how bad", cheaply,
+  #  over long windows. They are the only signal you can afford to keep for
+  #  every request forever -- which is exactly why they are aggregates, and
+  #  exactly why they can never tell you WHICH request was slow. That question
+  #  belongs to traces (stage 3).
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: obslab-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=6h   # a lab does not need more
+      - --web.enable-lifecycle              # POST /-/reload to reload rules
+      # Exemplars are what make "click a latency spike -> land in the trace"
+      # work. Without this flag Prometheus silently discards them.
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - promdata:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT}:9090"
+    depends_on:
+      - otel-collector
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ===========================================================================
+  #  TEMPO -- the trace store                                    [stage 3]
+  # ===========================================================================
+  #  WHY IT IS HERE: metrics tell you WHEN something broke and WHICH route.
+  #  They can never tell you WHICH REQUEST, or where inside that request the
+  #  time went, because they are aggregates -- that information was destroyed
+  #  at collection time on purpose, to make them cheap.
+  #
+  #  Tempo keeps individual requests. It is how you answer "show me a slow one
+  #  and tell me what it was waiting on".
+  # ===========================================================================
+  tempo:
+    image: grafana/tempo:2.7.1
+    container_name: obslab-tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    user: "0:0"   # so it can write to the named volume
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempodata:/var/tempo
+    ports:
+      - "${TEMPO_PORT}:3200"    # query API + Grafana datasource
+      # NOTE: Tempo also listens on 4317/4318 for OTLP, but those are NOT
+      # published to the host -- the collector reaches it over the compose
+      # network. Publishing them would collide with the collector's own ports.
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+
+  # ===========================================================================
+  #  LOKI -- the log store                                       [stage 4]
+  # ===========================================================================
+  #  WHY IT IS HERE: metrics say "5% of requests failed". Traces say "this
+  #  request failed, at this span". Only the log line says "duplicate key
+  #  violates unique constraint orders_pkey" -- the actual sentence a human
+  #  needs to fix the bug.
+  # ===========================================================================
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: obslab-loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    user: "0:0"
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - lokidata:/loki
+    ports:
+      - "${LOKI_PORT}:3100"
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+
+  # ===========================================================================
+  #  ALLOY -- the log shipper                                    [stage 4]
+  # ===========================================================================
+  #  WHY IT IS HERE: it reads container stdout from the Docker API and pushes
+  #  to Loki, parsing our Pino JSON on the way. The app never talks to Loki.
+  #
+  #  That indirection is deliberate: stdout is captured by Docker even if the
+  #  app crashes or OOMs, so the logs describing a death survive it. An app
+  #  that ships its own logs loses exactly the lines you most need.
+  # ===========================================================================
+  alloy:
+    image: grafana/alloy:v1.6.1
+    container_name: obslab-alloy
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Read-only access to the Docker API, to discover containers and read
+      # their log streams.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloydata:/var/lib/alloy/data
+    ports:
+      - "${ALLOY_PORT}:12345"   # Alloy's own UI -- useful for debugging pipelines
+    depends_on:
+      - loki
+    deploy:
+      resources:
+        limits:
+          memory: 224M
+
+  # ===========================================================================
+  #  GRAFANA -- the single pane of glass                         [stage 4]
+  # ===========================================================================
+  #  WHY IT IS HERE: it is the only component that talks to all three stores,
+  #  and therefore the only place the three signals become one workflow.
+  #  The correlation wiring lives in
+  #  observability/grafana/provisioning/datasources/datasources.yaml
+  #  -- that file is worth reading closely.
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: obslab-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      # Lab only: skip the login screen entirely.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Enables the trace-to-logs / trace-to-metrics buttons in the trace view.
+      GF_FEATURE_TOGGLES_ENABLE: "traceToMetrics"
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+
+  # ===========================================================================
+  #  cADVISOR -- per-container CPU / memory / network            [stage 5]
+  # ===========================================================================
+  #  WHY IT IS HERE: this is the "U" and "S" of USE (Utilisation, Saturation).
+  #  Your app's own metrics tell you what the app THINKS it is doing; cAdvisor
+  #  tells you what the kernel actually gave it.
+  #
+  #  The sharpest use in this lab: run the memLeak pathology in `buffer` mode.
+  #  The app's own heap metric (v8js_memory_heap_used_bytes) stays flat, because
+  #  Node Buffers live outside the V8 heap. cAdvisor's container_memory_rss
+  #  climbs steadily toward the 512M limit and the OOM kill. One of these two
+  #  metrics is lying to you, and only cAdvisor can prove it.
+  #
+  #  macOS NOTE: Docker Desktop runs containers inside a LinuxKit VM, so
+  #  cAdvisor reports the VM's view. Container-level numbers are accurate;
+  #  "machine" totals describe the VM, not your Mac.
+  # ===========================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: obslab-cadvisor
+    restart: unless-stopped
+    privileged: true
+    # Docker Desktop uses cgroup v2 and gives each container a PRIVATE cgroup
+    # namespace, so cAdvisor would otherwise see only its own cgroup as "/" and
+    # report a single series with no container names. `cgroup: host` puts it in
+    # the host cgroup namespace so it can walk the full hierarchy.
+    cgroup: host
+    command:
+      # Trim what cAdvisor collects -- the defaults are enormous and most of it
+      # is per-process detail nobody reads. This is cardinality control again.
+      - --docker_only=true
+      - --housekeeping_interval=10s
+      - --disable_metrics=percpu,sched,tcp,udp,advtcp,process,hugetlb,referenced_memory,cpu_topology,resctrl
+    volumes:
+      - /:/rootfs:ro
+      # Mount the SOCKET directly, not the whole /var/run directory. On Docker
+      # Desktop for macOS, /var/run/docker.sock is a symlink into the user's
+      # ~/.docker directory; bind-mounting the parent directory does not resolve
+      # it, cAdvisor's Docker factory fails to register, and you get metrics for
+      # the root cgroup only (id="/") with no container names at all.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "${CADVISOR_PORT}:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+
+  # ===========================================================================
+  #  NODE_EXPORTER -- host-level metrics                         [stage 5]
+  # ===========================================================================
+  #  WHY IT IS HERE: to answer "is the box itself the problem?" -- load average,
+  #  memory pressure, disk, file descriptors.
+  #
+  #  macOS CAVEAT, and it is a real one: this reports the Docker Desktop
+  #  LinuxKit VM, NOT your Mac. Treat its numbers as "the VM my containers share"
+  #  rather than "my laptop". On a real Linux host it would be your actual box.
+  #  Being clear about what a metric actually measures is half the skill.
+  # ===========================================================================
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: obslab-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --collector.disable-defaults
+      # Only the collectors that mean anything in this environment.
+      - --collector.cpu
+      - --collector.meminfo
+      - --collector.loadavg
+      - --collector.filesystem
+      - --collector.netdev
+      - --collector.diskstats
+    pid: host
+    volumes:
+      # NOTE: the usual recipe for this mount is `/:/host:ro,rslave`. Docker
+      # Desktop on macOS rejects that ("path / is mounted on / but it is not a
+      # shared or slave mount") because the VM's root is not a shared mount.
+      # Plain `ro` works here; on a real Linux host, add back `,rslave` so the
+      # exporter sees filesystems mounted after it starts.
+      - /:/host:ro
+    ports:
+      - "${NODE_EXPORTER_PORT}:9100"
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+
+  # ===========================================================================
+  #  POSTGRES_EXPORTER -- database internals                     [stage 5]
+  # ===========================================================================
+  #  WHY IT IS HERE: your app can only see the database from outside -- it knows
+  #  a query took 40ms but not WHY. This exposes what Postgres knows about
+  #  itself: active connections vs max_connections, cache hit ratio, rows
+  #  fetched vs returned, locks, and (via pg_stat_statements) per-query stats.
+  #
+  #  This is what makes the flushCache exercise legible: you will watch
+  #  pg_stat_database_blks_read spike as a cold cache pushes reads that used to
+  #  be served by Redis onto disk.
+  # ===========================================================================
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: obslab-postgres-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      PG_EXPORTER_DISABLE_DEFAULT_METRICS: "false"
+    ports:
+      - "${POSTGRES_EXPORTER_PORT}:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+
+  # ===========================================================================
+  #  REDIS_EXPORTER -- cache internals                           [stage 5]
+  # ===========================================================================
+  #  WHY IT IS HERE: the app records its own cache hit/miss counter, but that
+  #  only covers code paths you remembered to instrument. Redis knows the truth
+  #  about keyspace hits/misses, evictions, memory use and connected clients.
+  #
+  #  Watch `redis_evicted_keys_total` during load: our Redis is capped at 128mb
+  #  with allkeys-lru, so under pressure it silently throws away cached data.
+  #  Silent eviction looks exactly like a cache that was never warm.
+  # ===========================================================================
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    container_name: obslab-redis-exporter
+    restart: unless-stopped
+    command: ["--redis.addr=redis://redis:6379"]
+    ports:
+      - "${REDIS_EXPORTER_PORT}:9121"
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  # ===========================================================================
+  #  K6 -- load generator                                        [stage 8]
+  # ===========================================================================
+  #  WHY IT IS HERE: a pathology with no traffic is invisible. Metrics are
+  #  rates; with zero requests every graph is flat and every percentile is NaN.
+  #  You need sustained, realistic load for any of this to be observable.
+  #
+  #  Uses a compose PROFILE so it does not start with the stack -- you run a
+  #  scenario on demand:
+  #
+  #     docker compose run --rm k6 run /scripts/01-baseline.js
+  #
+  #  Each scenario runs a healthy baseline first, then switches on ONE
+  #  pathology, then heals. The baseline is not padding: without a "before" on
+  #  the graph you cannot tell an elevated p99 from a normally-high one.
+  # ===========================================================================
+  k6:
+    image: grafana/k6:0.55.0
+    container_name: obslab-k6
+    restart: unless-stopped
+    profiles: ["load"]     # excluded from `docker compose up`
+    volumes:
+      - ./load/k6:/scripts:ro
+    environment:
+      # Container-network DNS name, not localhost -- k6 runs inside compose and
+      # reaches the API over the shared network like any other service.
+      API: http://orders-api:8080
+
+volumes:
+  pgdata:
+  promdata:
+  tempodata:
+  lokidata:
+  alloydata:
+  grafanadata:

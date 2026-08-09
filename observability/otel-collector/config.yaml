@@ -1,0 +1,248 @@
+# =============================================================================
+#  OpenTelemetry Collector
+# =============================================================================
+#  WHY THIS EXISTS AT ALL
+#
+#  The app could push straight to Prometheus/Tempo/Loki. It doesn't, because
+#  then every backend change means an app change and a redeploy. The collector
+#  is a seam: the app speaks one protocol (OTLP) to one address, and routing,
+#  batching, filtering and format translation happen out here where you can
+#  change them without touching code.
+#
+#  It is also where you enforce cost control. Sampling, attribute dropping and
+#  cardinality limits belong here, not scattered through your services.
+# =============================================================================
+
+receivers:
+  # One endpoint, two wire formats. Our Node SDK uses HTTP (4318).
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # ===========================================================================
+  #  DOCKER_STATS -- per-container CPU / memory / network
+  # ===========================================================================
+  #  This is the "U" and "S" of USE (Utilisation, Saturation): what the kernel
+  #  actually gave each container, as opposed to what the app thinks it used.
+  #
+  #  WHY THIS AND NOT JUST cADVISOR:
+  #  cAdvisor is the conventional answer and it is in this compose file, but on
+  #  Docker Desktop for macOS it cannot enumerate per-container cgroups -- it
+  #  reports a single series for the root cgroup (id="/") with no container
+  #  names, even with the docker socket mounted and `cgroup: host` set. The
+  #  containers run inside a LinuxKit VM whose cgroup hierarchy it cannot walk.
+  #
+  #  This receiver asks the Docker API instead of reading cgroups, so it works
+  #  identically on macOS and Linux. cAdvisor is kept because it is what you
+  #  will meet in real Linux deployments and its metric names are worth
+  #  recognising -- see docs/05-infra-metrics.md.
+  #
+  #  THE LESSON THIS ENABLES: run `make leak-buffer`, then compare
+  #    container_memory_usage  (here)      -- climbs toward the 512M limit
+  #    v8js_memory_heap_used_bytes (app)   -- stays completely flat
+  #  Same leak. One metric sees it, the other swears the process is healthy.
+  # ===========================================================================
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 10s
+    # Only this lab's containers.
+    container_labels_to_metric_labels:
+      com.docker.compose.service: compose_service
+    metrics:
+      container.cpu.utilization:
+        enabled: true
+      container.memory.usage.total:
+        enabled: true
+      container.memory.usage.limit:
+        enabled: true
+      container.network.io.usage.rx_bytes:
+        enabled: true
+      container.network.io.usage.tx_bytes:
+        enabled: true
+
+processors:
+  # ORDER MATTERS in the pipelines below. memory_limiter must come FIRST so it
+  # can reject data before anything else allocates for it -- otherwise the
+  # collector OOMs while processing the batch that would have OOMed it.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 200
+    spike_limit_mib: 50
+
+  # Batching is what makes this affordable. Without it every span is its own
+  # network round trip to Tempo.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+  # ===========================================================================
+  #  RESOURCE TRIMMING -- cardinality control, and a cautionary tale
+  # ===========================================================================
+  #  `resource_to_telemetry_conversion` (in the prometheus exporter below)
+  #  promotes resource attributes into metric labels. That is REQUIRED to tell
+  #  orders-api from payments-api -- but it promotes ALL of them, and the OTel
+  #  SDK's default resource detectors attach a lot of junk:
+  #
+  #    process.command_args   the ENTIRE argv array, as one label value
+  #    process.pid            changes on every restart
+  #    host.name              the container id -- changes on every recreate
+  #    process.executable.*   identical for every Node service you will ever run
+  #
+  #  Measured in this lab before adding this processor: process_command_args
+  #  was 211KB, the single largest label in the whole TSDB. And because pid and
+  #  host.name change on restart, every `docker compose up` ABANDONED the old
+  #  series and created a fresh set -- a slow leak that a long-running system
+  #  eventually dies from.
+  #
+  #  Keep only what you would actually group or filter by.
+  #  See docs/04-cardinality.md.
+  # ===========================================================================
+  resource/trim:
+    attributes:
+      - { key: process.command_args,      action: delete }
+      - { key: process.command,           action: delete }
+      - { key: process.executable.name,   action: delete }
+      - { key: process.executable.path,   action: delete }
+      - { key: process.owner,             action: delete }
+      - { key: process.pid,               action: delete }
+      - { key: process.runtime.description, action: delete }
+      - { key: process.runtime.name,      action: delete }
+      - { key: process.runtime.version,   action: delete }
+      - { key: host.name,                 action: delete }
+      - { key: host.arch,                 action: delete }
+      # Deliberately KEPT: service.name, service.version, service.role,
+      # deployment.environment -- all bounded, all things you filter by.
+
+connectors:
+  # ===========================================================================
+  #  SPANMETRICS -- RED metrics computed FROM traces
+  # ===========================================================================
+  #  A "connector" is an exporter and a receiver joined together: it consumes
+  #  the traces pipeline and produces a metrics pipeline.
+  #
+  #  Why bother, when the app already emits http_server_request_duration?
+  #  Because these metrics carry EXEMPLARS -- each histogram bucket keeps a
+  #  sample trace_id. That is the mechanism behind "click the latency spike in
+  #  Grafana, land in the exact trace that caused it". Without exemplars you can
+  #  see that p99 got worse but have no path from the graph to a specific
+  #  request, and you are back to guessing.
+  # ===========================================================================
+  spanmetrics:
+    histogram:
+      explicit:
+        # Must cover the range your pathologies produce. slowDependency pushes
+        # /checkout to 5s; if the top bucket were 1s, every percentile above it
+        # would be interpolated fiction.
+        buckets: [2ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s, 10s]
+
+    # Dimensions become metric LABELS. Every one you add multiplies the number
+    # of time series. These three are bounded and worth it; adding something
+    # like user_id here is exactly the cardinality bomb in docs/04-cardinality.md.
+    dimensions:
+      - name: http.route
+      - name: http.request.method
+      - name: http.response.status_code
+
+    exemplars:
+      enabled: true
+
+    # Only produce metrics for server + client spans. Internal spans would
+    # triple the series count for no diagnostic gain.
+    events:
+      enabled: false
+
+exporters:
+  # --- metrics -> Prometheus (pull) -----------------------------------------
+  # The collector does NOT push to Prometheus; it exposes :8889 and Prometheus
+  # pulls. That pull model is why a dead collector shows up as a failed scrape
+  # (a signal) rather than as silence (no signal).
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+    # Promotes resource attributes (service.name, service.role, ...) into
+    # metric labels. Without this, metrics from every service collapse together
+    # and you cannot tell orders-api from payments-api.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+    # Required for exemplars to survive the scrape.
+    enable_open_metrics: true
+
+  # --- traces -> Tempo (push) -----------------------------------------------
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true   # lab-local; never do this across a real network
+
+    # =========================================================================
+    #  BOUNDED QUEUE -- learned the hard way while building this lab
+    # =========================================================================
+    #  During a heavy k6 run, Tempo was OOM-killed (exit 137) by 53,000 traces
+    #  in 4 minutes at 100% sampling. That was expected-ish. What was NOT
+    #  expected: METRICS stopped arriving too, and the cache/DB panels read
+    #  zero while the app was demonstrably serving 200+ requests/second.
+    #
+    #  Why: the traces exporter retried forever against a dead Tempo, its
+    #  unbounded queue grew, and memory_limiter -- which is SHARED by every
+    #  pipeline in this collector -- began refusing data across the board. One
+    #  dead backend silently degraded a completely different signal.
+    #
+    #  A bounded queue plus a capped retry window makes the traces pipeline
+    #  DROP data instead of consuming the memory the metrics pipeline needs.
+    #
+    #  THE GENERAL LESSON: shared infrastructure couples failures you assumed
+    #  were independent. When a dashboard goes blank, "is the telemetry
+    #  pipeline healthy?" is a real question -- which is exactly why the
+    #  CollectorDroppingData alert exists.
+    # =========================================================================
+    sending_queue:
+      enabled: true
+      queue_size: 500
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      # Give up rather than retrying into an OOM.
+      max_elapsed_time: 60s
+
+  # Prints received telemetry to the collector's own logs. Add this to a
+  # pipeline when data is not arriving -- it instantly tells you whether the
+  # problem is upstream (the app is not sending) or downstream (the backend is
+  # not accepting).
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    # Traces fan out to TWO destinations: Tempo for storage, and the
+    # spanmetrics connector which turns them into metrics.
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo, spanmetrics]
+
+    # Metrics come from two sources: the app's own OTLP metrics, and the
+    # spanmetrics connector's trace-derived ones.
+    metrics:
+      receivers: [otlp, spanmetrics, docker_stats]
+      # resource/trim runs before the exporter promotes attributes to labels.
+      processors: [memory_limiter, resource/trim, batch]
+      exporters: [prometheus]
+
+  # The collector's own health. "Who watches the watcher" is a real question --
+  # if this pipeline stalls, every graph in Grafana goes flat, which looks
+  # exactly like "no traffic".
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: basic
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

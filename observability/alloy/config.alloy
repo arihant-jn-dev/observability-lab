@@ -1,0 +1,116 @@
+// =============================================================================
+//  Grafana Alloy -- the log shipper
+// =============================================================================
+//  WHY A SHIPPER AT ALL, instead of the app pushing logs itself?
+//
+//  Because the app writing JSON to stdout is the most robust thing it can do.
+//  stdout survives the app crashing, OOMing, or losing network -- Docker has
+//  already captured the line. An app that pushes its own logs loses exactly the
+//  logs describing its own death, which are the ones you need.
+//
+//  So: app -> stdout -> Docker -> Alloy -> Loki.
+// =============================================================================
+
+// Discover every container on this Docker host.
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "10s"
+}
+
+// Turn Docker metadata into Loki labels.
+//
+// Keep this list SHORT and BOUNDED. Each unique combination is a separate Loki
+// stream. container + compose service is plenty to narrow any search.
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // "/obslab-orders-api" -> "obslab-orders-api"
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(.*)"
+    target_label  = "container"
+  }
+
+  // The compose service name (orders-api, postgres, ...).
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+
+  // Only ship logs from this lab's containers.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "obslab"
+    action        = "keep"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.parse.receiver]
+  labels     = { job = "docker" }
+}
+
+// =============================================================================
+//  THE CORRELATION STEP
+// =============================================================================
+loki.process "parse" {
+
+  // Our app logs JSON (Pino). Pull the fields we care about out of it.
+  // Non-JSON lines (Postgres, Redis, Grafana) simply produce no extractions
+  // and pass through untouched -- which is why the stack still works even
+  // though only two of the containers emit structured logs.
+  stage.json {
+    expressions = {
+      level    = "level",
+      service  = "service",
+      role     = "role",
+      trace_id = "trace_id",
+      msg      = "msg",
+    }
+  }
+
+  // BOUNDED fields become labels. `level` has ~6 values, `service` has ~3.
+  // These are what you filter by: {service="orders-api", level="error"}
+  stage.labels {
+    values = {
+      level   = "",
+      service = "",
+      role    = "",
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  //  trace_id is UNBOUNDED -- one value per request, forever.
+  //
+  //  As a LABEL it would create one Loki stream per request and melt the
+  //  index. As STRUCTURED METADATA it is stored alongside the line, is
+  //  queryable, and costs nothing in the index.
+  //
+  //  This is the same lesson as Prometheus metric labels, in a different
+  //  system: high-cardinality identifiers attach to INDIVIDUAL EVENTS,
+  //  never to the aggregate/index dimension.
+  // ---------------------------------------------------------------------
+  stage.structured_metadata {
+    values = {
+      trace_id = "",
+    }
+  }
+
+  // Use the app's own timestamp rather than the time Alloy read the line,
+  // so a shipper backlog does not silently shift your logs.
+  stage.timestamp {
+    source = "time"
+    format = "RFC3339Nano"
+    action_on_failure = "fudge"
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

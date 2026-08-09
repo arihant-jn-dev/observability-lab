@@ -1,0 +1,522 @@
+{
+  "uid": "use-resources",
+  "title": "USE \u2014 resources (why is it slow?)",
+  "description": "Utilisation, Saturation, Errors \u2014 for every resource the service depends on. RED tells you the service is unhealthy; USE tells you which resource is the reason. Saturation (queueing) matters more than utilisation: a resource at 70% with a queue is in more trouble than one at 95% with none.",
+  "tags": [
+    "obslab",
+    "USE"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "CONTAINERS \u2014 utilisation",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU utilisation by container",
+      "description": "What the kernel actually gave each container. For a Node service, sustained CPU near 100% of one core means the event loop is the bottleneck \u2014 Node cannot use a second core for your request handler, so 'add CPU' does not help; you need to do less work or run more processes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "container_cpu_utilization_ratio{container_name=~\"obslab-.*\"}",
+          "legendFormat": "{{container_name}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory by container",
+      "description": "THE KEY PANEL FOR THE memLeak EXERCISE. Compare this against 'Node heap' below. In buffer mode this line climbs steadily toward the 512M limit while the heap graph stays perfectly flat \u2014 because Node Buffers live outside the V8 heap. One of those two metrics is lying, and this is the one that is not.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "container_memory_usage_total_bytes{container_name=~\"obslab-.*\"}",
+          "legendFormat": "{{container_name}}"
+        },
+        {
+          "refId": "B",
+          "expr": "container_memory_usage_limit_bytes{container_name=\"obslab-orders-api\"}",
+          "legendFormat": "orders-api LIMIT (OOM kill line)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "NODE RUNTIME \u2014 saturation of the event loop",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Event loop delay (p99) \u2014 the Node saturation metric",
+      "description": "How long a task waited before the event loop could run it. This is SATURATION, and for a Node service it is more diagnostic than CPU%. High delay with low CPU means you are blocked on something synchronous; high delay with high CPU means you are genuinely compute-bound. During cpuBurn this spikes hard while the DB and cache stay idle \u2014 that combination is the signature of 'the problem is us, not our dependencies'.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "nodejs_eventloop_delay_p99_seconds",
+          "legendFormat": "{{service_name}}/{{service_role}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "V8 heap used (contrast with container memory)",
+      "description": "The metric most Node dashboards show \u2014 and the one that MISSES an off-heap leak entirely. Run `make leak-buffer` and watch this stay flat while container memory climbs. Then run `make leak-heap` and watch both move together. Same word, 'leak'; completely different visibility.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name, service_role) (v8js_memory_heap_used_bytes)",
+          "legendFormat": "{{service_name}}/{{service_role}} heap"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "POSTGRES \u2014 the resource everything else protects",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Connection pool \u2014 in_use / idle / WAITING",
+      "description": "`waiting` is the most under-appreciated series in this lab. When it is above zero, requests are queueing for a database connection: nothing has failed, the DB is not busy, CPU is flat \u2014 and yet everything is slow. Pool saturation is invisible to both app metrics and DB metrics, which is why it is so consistently misdiagnosed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (state) (db_pool_connections)",
+          "legendFormat": "{{state}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Postgres: rows fetched vs returned",
+      "description": "The N+1 detector at the database layer. Postgres reports no slow queries during an N+1 \u2014 each query is sub-millisecond and index-backed. What DOES change is the number of round trips. Watch tup_returned climb while query duration stays flat.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(pg_stat_database_tup_returned{datname=\"ordersdb\"}[1m])",
+          "legendFormat": "rows returned/s"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(pg_stat_database_tup_fetched{datname=\"ordersdb\"}[1m])",
+          "legendFormat": "rows fetched/s"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(pg_stat_database_xact_commit{datname=\"ordersdb\"}[1m])",
+          "legendFormat": "commits/s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Postgres: block reads (disk) vs hits (buffer cache)",
+      "description": "THE flushCache PANEL. When Redis empties, reads that were served from memory land here. blks_read climbing means Postgres is going to disk for data it used to have cached \u2014 the moment a *performance* component's failure becomes an *availability* problem.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(pg_stat_database_blks_read{datname=\"ordersdb\"}[1m])",
+          "legendFormat": "blocks read from DISK/s"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(pg_stat_database_blks_hit{datname=\"ordersdb\"}[1m])",
+          "legendFormat": "blocks from cache/s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Postgres: active connections vs limit",
+      "description": "Utilisation of a hard-capped resource. Unlike CPU, hitting max_connections does not degrade \u2014 it REFUSES. Resources with hard limits fail cliff-edge rather than gradually, which is why they deserve their own alert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(pg_stat_activity_count{datname=\"ordersdb\"})",
+          "legendFormat": "active connections"
+        },
+        {
+          "refId": "B",
+          "expr": "max(pg_settings_max_connections)",
+          "legendFormat": "max_connections"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "REDIS \u2014 the cache",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis keyspace hits vs misses",
+      "description": "Redis's own view, independent of the app's counter. Worth having both: the app metric only covers code paths you remembered to instrument, this one covers everything.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(redis_keyspace_hits_total[1m])",
+          "legendFormat": "hits/s"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(redis_keyspace_misses_total[1m])",
+          "legendFormat": "misses/s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis evictions \u2014 SILENT data loss",
+      "description": "Our Redis is capped at 128mb with allkeys-lru, so under memory pressure it quietly discards keys. Nothing errors. The app sees a cache miss and carries on. Evicted keys look identical to a cache that was never warm \u2014 which is why this counter deserves an alert even though nothing is 'broken'.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 20,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(redis_evicted_keys_total[1m])",
+          "legendFormat": "evicted keys/s"
+        },
+        {
+          "refId": "B",
+          "expr": "redis_memory_used_bytes / clamp_min(redis_memory_max_bytes, 1)",
+          "legendFormat": "memory used / max"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis latency & clients",
+      "description": "Redis is single-threaded: one slow command blocks every other client. Connected-client count rising alongside latency usually means commands are queueing behind something expensive (a KEYS scan, a big pipeline, a flush).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "redis_connected_clients",
+          "legendFormat": "connected clients"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(redis_commands_processed_total[1m])",
+          "legendFormat": "commands/s"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "DEPENDENCIES \u2014 someone else's fault",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 44
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbound call latency (orders-api \u2192 payments-api)",
+      "description": "Client-side view of a dependency vs what that dependency actually spent. When THIS is slow but payments-api's own server-side duration is fast, the time is going into the network or your own connection pool \u2014 not into their code. When both are slow, it really is them. Trace-derived (spanmetrics), so the diamonds are exemplars: click one to open the offending trace.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{service_name=\"orders-api\",span_kind=\"SPAN_KIND_CLIENT\"}[1m])))",
+          "legendFormat": "p99 client-side (what WE wait)",
+          "exemplar": true
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{service_name=\"payments-api\",span_kind=\"SPAN_KIND_SERVER\"}[1m])))",
+          "legendFormat": "p99 server-side (what THEY spend)",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Database query duration (p99)",
+      "description": "From the app's perspective. Note during the nPlusOne exercise this stays FLAT \u2014 each of the 50 queries is fast. The damage is in the count, not the duration, which is precisely why metrics alone cannot find N+1 and a trace finds it instantly.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(db_client_operation_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99 query duration"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(db_client_operation_duration_seconds_count[1m]))",
+          "legendFormat": "queries/sec (THIS is what N+1 moves)"
+        }
+      ]
+    }
+  ]
+}

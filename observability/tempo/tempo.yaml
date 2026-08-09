@@ -1,0 +1,71 @@
+# =============================================================================
+#  Tempo -- the trace store
+# =============================================================================
+#  Tempo is deliberately dumb compared to Prometheus: it does almost no
+#  indexing. It is a key-value store from trace_id -> trace, plus (since 2.x) a
+#  TraceQL engine that brute-force scans blocks.
+#
+#  That design is the whole economic argument for tracing:
+#    - storing every span with full detail is affordable ONLY if you do not
+#      index them all
+#    - so the cheap question is "show me trace X" (you have the id)
+#    - and the expensive question is "find all traces where ..." (a scan)
+#
+#  Which is why the intended workflow is metrics-first: use Prometheus to find
+#  WHEN and WHICH ROUTE is bad, grab a trace_id from an exemplar, then ask Tempo
+#  for that one trace. Going straight to Tempo and searching blind is slow, and
+#  is the most common way people conclude "tracing is useless".
+# =============================================================================
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  # The ingester holds traces in MEMORY until it cuts a block, so these two
+  # settings are the main lever on Tempo's memory footprint.
+  #
+  # Tuned down after Tempo was OOM-killed during a heavy k6 run (53k traces in
+  # 4 minutes at 100% sampling). Shorter blocks = less resident data = more
+  # headroom, at the cost of more, smaller blocks on disk. A lab wants the
+  # headroom; production usually wants the opposite.
+  max_block_duration: 2m
+  complete_block_timeout: 30s
+  # Flush completed blocks out of memory promptly.
+  flush_check_period: 10s
+  max_block_bytes: 52428800   # 50MB -- cut a block at this size regardless of time
+
+compactor:
+  compaction:
+    # A lab does not need history. Keeping this short is also what keeps the
+    # whole stack inside the 2GB RAM budget.
+    block_retention: 30m
+    compacted_block_retention: 5m
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# Lets Grafana show the service graph and span-level RED without a separate
+# metrics pipeline. We ALSO compute span metrics in the collector (see
+# observability/otel-collector/config.yaml) -- the two are alternative
+# approaches and it is worth knowing both exist.
+overrides:
+  defaults:
+    metrics_generator:
+      processors: []

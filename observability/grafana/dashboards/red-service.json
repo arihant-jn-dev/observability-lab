@@ -1,0 +1,488 @@
+{
+  "uid": "red-service",
+  "title": "RED \u2014 orders-api (start here)",
+  "description": "Rate, Errors, Duration. The three numbers that describe a request-serving service from the caller's point of view. Read top to bottom: is traffic normal, is it failing, is it slow.",
+  "tags": [
+    "obslab",
+    "RED"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(http_server_request_duration_seconds_count, service_name)",
+        "current": {
+          "text": "orders-api",
+          "value": "orders-api"
+        },
+        "refresh": 2,
+        "includeAll": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "RATE \u2014 is traffic normal?",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests / sec by route",
+      "description": "A DROP here is as alarming as a spike. If traffic falls to zero, either nobody is calling you or something upstream is failing before it reaches you \u2014 and no latency or error metric will tell you that, because there are no requests to measure.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_route) (rate(http_server_request_duration_seconds_count{service_name=\"$service\"}[1m]))",
+          "legendFormat": "{{http_route}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput by status code",
+      "description": "Splitting by status class separates 'working', 'client is wrong' (4xx) and 'we are wrong' (5xx). A rise in 4xx is usually a caller change or bad input, not an outage \u2014 treating them the same is how you get paged for someone else's typo.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 30,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_response_status_code) (rate(http_server_request_duration_seconds_count{service_name=\"$service\"}[1m]))",
+          "legendFormat": "{{http_response_status_code}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "ERRORS \u2014 is it failing?",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Error rate (5xx) \u2014 whole service",
+      "description": "The single number to check first. Expressed as a RATIO, not a count: 50 errors/sec is catastrophic at 100 rps and irrelevant at 100,000 rps. Alert on ratios; counts do not survive traffic growth.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"$service\",http_response_status_code=~\"5..\"}[1m])) / clamp_min(sum(rate(http_server_request_duration_seconds_count{service_name=\"$service\"}[1m])), 0.001)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Error ratio by route",
+      "description": "Which endpoint is failing. A service-wide error rate of 2% might be one endpoint at 100% \u2014 averaging across routes hides exactly the thing you need to find.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 18,
+        "x": 6,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_route) (rate(http_server_request_duration_seconds_count{service_name=\"$service\",http_response_status_code=~\"5..\"}[1m])) / clamp_min(sum by (http_route) (rate(http_server_request_duration_seconds_count{service_name=\"$service\"}[1m])), 0.001)",
+          "legendFormat": "{{http_route}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "DURATION \u2014 is it slow? (click a diamond to open the trace)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency percentiles \u2014 p50 / p95 / p99",
+      "description": "Three lines, because one number cannot describe a distribution. p50 is the typical user. p99 is your worst 1% \u2014 at 1000 rps that is 10 users EVERY SECOND. When p50 stays flat and p99 climbs, you have a subset problem (one slow shard, one cold cache, one bad host), not a general slowdown. SOURCE: these are computed from TRACES by the collector's spanmetrics connector, not from the app's own metrics \u2014 that is what lets each point carry an exemplar. The diamonds under the lines are those exemplars: click one to open the exact trace behind that sample.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{service_name=\"$service\",span_kind=\"SPAN_KIND_SERVER\"}[1m])))",
+          "legendFormat": "p50",
+          "exemplar": true
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{service_name=\"$service\",span_kind=\"SPAN_KIND_SERVER\"}[1m])))",
+          "legendFormat": "p95",
+          "exemplar": true
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{service_name=\"$service\",span_kind=\"SPAN_KIND_SERVER\"}[1m])))",
+          "legendFormat": "p99",
+          "exemplar": true
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(traces_span_metrics_duration_milliseconds_sum{service_name=\"$service\",span_kind=\"SPAN_KIND_SERVER\"}[1m])) / clamp_min(sum(rate(traces_span_metrics_duration_milliseconds_count{service_name=\"$service\",span_kind=\"SPAN_KIND_SERVER\"}[1m])), 0.001)",
+          "legendFormat": "MEAN (the liar)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "p99 by route",
+      "description": "Where the slowness actually lives. 'The service is slow' is almost never true of every endpoint \u2014 this panel is how you find the one that is. Trace-derived (spanmetrics), so every point carries an exemplar: click a diamond to jump straight into that request's trace.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (http_route, le) (rate(traces_span_metrics_duration_milliseconds_bucket{service_name=\"$service\",span_kind=\"SPAN_KIND_SERVER\"}[1m])))",
+          "legendFormat": "{{http_route}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "type": "heatmap",
+      "title": "Latency distribution (heatmap)",
+      "description": "The shape percentiles hide. Look for BIMODALITY \u2014 two separate bands rather than one. Two bands means two populations (cache hit vs miss, warm vs cold, healthy vs broken replica), and no single percentile can describe them. This is the panel that tells you 'slow' and 'broken' are different requests.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "unit": "s"
+        },
+        "color": {
+          "scheme": "Spectral",
+          "mode": "scheme"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (le) (increase(http_server_request_duration_seconds_bucket{service_name=\"$service\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "BUSINESS \u2014 is the thing the company cares about still happening?",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Orders created / sec",
+      "description": "The metric auto-instrumentation can never give you. A deploy that returns HTTP 200 containing an empty cart is invisible to every technical metric on this dashboard and instantly visible here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 20,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(orders_created_total[2m]))",
+          "legendFormat": "{{status}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(orders_failed_total[2m]))",
+          "legendFormat": "failed"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache hit ratio",
+      "description": "Not alarming when LOW \u2014 alarming when it DROPS SUDDENLY. A cache absorbing 95% of reads is load-bearing; when it empties, the database behind it receives 20x its normal traffic. This is the leading indicator for the flushCache exercise.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(cache_operations_total{result=\"hit\"}[2m])) / clamp_min(sum(rate(cache_operations_total[2m])), 0.001)",
+          "legendFormat": "hit ratio"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth & lag (async work)",
+      "description": "'Request succeeded' and 'work actually happened' are different questions once a queue is involved. LAG is the honest metric: depth stays near zero even while badly backed up, as long as the worker is draining fast. Lag measures what the user waits.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(queue_depth)",
+          "legendFormat": "depth (jobs)"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(job_queue_lag_seconds_bucket[2m])))",
+          "legendFormat": "p99 lag (s)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Active lab pathologies",
+      "description": "Which failure modes are currently switched on. Keep this visible so you never debug a symptom you injected two exercises ago and forgot about.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 45
+      },
+      "fieldConfig": {
+        "defaults": {
+          "max": 1,
+          "min": 0,
+          "custom": {
+            "fillOpacity": 40,
+            "lineWidth": 1,
+            "drawStyle": "bars"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pathology) (lab_pathologies_active) > 0",
+          "legendFormat": "{{pathology}}"
+        }
+      ]
+    }
+  ]
+}
